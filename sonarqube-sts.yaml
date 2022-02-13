@@ -1,0 +1,169 @@
+# ---
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: sonarqube-postgresql
+#   labels:
+#     app.kubernetes.io/name: postgresql
+#   namespace: sonarqube
+# type: Opaque
+# data:
+#   postgresql-postgres-password: "UHR3ZnFwdjMwSQ=="
+#   postgresql-password: "c29uYXJQYXNz"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sonarqube-sonarqube-init-sysctl
+  labels:
+    app: sonarqube
+data:
+  init_sysctl.sh: |-
+    if [[ "$(sysctl -n vm.max_map_count)" -lt 524288 ]]; then
+      sysctl -w vm.max_map_count=524288
+    fi
+    if [[ "$(sysctl -n fs.file-max)" -lt 131072 ]]; then
+      sysctl -w fs.file-max=131072
+    fi
+    if [[ "$(ulimit -n)" != "unlimited" ]]; then
+      if [[ "$(ulimit -n)" -lt 131072 ]]; then
+        echo "ulimit -n 131072"
+        ulimit -n 131072
+      fi
+    fi
+    if [[ "$(ulimit -u)" != "unlimited" ]]; then
+      if [[ "$(ulimit -u)" -lt 8192 ]]; then
+        echo "ulimit -u 8192"
+        ulimit -u 8192
+      fi
+    fi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sonarqube-sonarqube-jdbc-config
+  labels:
+    app: sonarqube
+data:
+  SONAR_JDBC_USERNAME: "sonarUser"
+  SONAR_JDBC_URL: "jdbc:postgresql://sonarqube-postgresql:5432/sonarDB"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sonarqube-sonarqube
+  labels:
+    app: sonarqube
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9000
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: sonarqube
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sonarqube-sonarqube
+  labels:
+    app: sonarqube
+spec:
+  replicas: 1
+  serviceName: sonarqube-sonarqube
+  selector:
+    matchLabels:
+      app: sonarqube
+  template:
+    metadata:
+      labels:
+        app: sonarqube
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: "wait-for-db"
+          image: busybox:1.32
+          imagePullPolicy: IfNotPresent
+          resources:
+            {}
+          command: ["/bin/sh", "-c", "for i in $(seq 1 200); do nc -z -w3 sonarqube-postgresql 5432 && exit 0 || sleep 2; done; exit 1"]
+        - name: init-sysctl
+          image: busybox:1.32
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          resources:
+            {}
+          command: ["sh",
+            "-e",
+            "/tmp/scripts/init_sysctl.sh"]
+          volumeMounts:
+            - name: init-sysctl
+              mountPath: /tmp/scripts/
+      containers:
+        - name: sonarqube
+          image: "sonarqube:9.3.0-community"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9000
+              protocol: TCP
+            - name: monitoring-web
+              containerPort: 8000
+              protocol: TCP
+            - name: monitoring-ce
+              containerPort: 8001
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 800m
+              memory: 4Gi
+            requests:
+              cpu: 400m
+              memory: 2Gi
+          env:
+            - name: SONAR_JDBC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sonarqube-postgresql
+                  key: postgresql-password
+          envFrom:
+            - configMapRef:
+                name: sonarqube-sonarqube-jdbc-config
+          securityContext:
+            runAsUser: 1000
+          volumeMounts:
+            - mountPath: /opt/sonarqube/certs
+              name: sonarqube
+              subPath: certs
+            - mountPath: /opt/sonarqube/data
+              name: sonarqube
+              subPath: data
+            - mountPath: /opt/sonarqube/temp
+              name: sonarqube
+              subPath: temp
+            - mountPath: /opt/sonarqube/logs
+              name: sonarqube
+              subPath: logs
+            - mountPath: /tmp
+              name: tmp-dir
+      serviceAccountName: default
+      volumes:
+      - name: ca-certs
+        secret:
+          secretName: your-secret
+      - name: init-sysctl
+        configMap:
+          name: sonarqube-sonarqube-init-sysctl
+          items:
+            - key: init_sysctl.sh
+              path: init_sysctl.sh
+      - name: sonarqube
+        emptyDir:
+          {}
+      - name : tmp-dir
+        emptyDir:
+          {}
